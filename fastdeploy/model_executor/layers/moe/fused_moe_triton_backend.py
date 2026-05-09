@@ -46,6 +46,7 @@ from fastdeploy.platforms import current_platform
 from fastdeploy.utils import ceil_div, register_custom_python_op
 
 from ..quantization.quant_base import QuantMethodBase
+from .fused_moe_backend_base import UnquantizedFusedMoEMethod
 
 
 class TritonWeightOnlyMoEMethod(QuantMethodBase):
@@ -1886,7 +1887,7 @@ class BlockWiseFP8MoEMethod(QuantMethodBase):
         )
 
 
-class TritonBF16MoEMethod(QuantMethodBase):
+class TritonMoEMethod(UnquantizedFusedMoEMethod):
     """
     Use Triton Group Gemm (BF16 unquantized) to compute Fused MoE.
 
@@ -1896,32 +1897,7 @@ class TritonBF16MoEMethod(QuantMethodBase):
     """
 
     def __init__(self, quant_config=None):
-        self.quant_config = quant_config
-        self.added_weight_attrs = ["up_gate_proj_weight", "down_proj_weight"]
-
-    def process_prequanted_weights(self, layer: nn.Layer, state_dict, is_rearrange: bool = False) -> None:
-        pass
-
-    def create_weights(self, layer: nn.Layer, **extra_weight_attrs):
-        """
-        Reuse UnquantizedFusedMoEMethod weight creation logic.
-        Weight shapes on CUDA (non-torch format):
-          up_gate_proj_weight: [E, hidden_size, moe_intermediate_size * 2]  (K-major)
-          down_proj_weight:    [E, moe_intermediate_size, hidden_size]       (K-major)
-        The Triton kernel reads B as [E, K, N] which maps directly to these shapes.
-        """
-        from fastdeploy.model_executor.layers.moe.fused_moe_backend_base import (
-            UnquantizedFusedMoEMethod,
-        )
-
-        UnquantizedFusedMoEMethod.create_weights(self, layer, **extra_weight_attrs)
-
-    def process_weights_after_loading(self, layer: nn.Layer):
-        from fastdeploy.model_executor.layers.moe.fused_moe_backend_base import (
-            UnquantizedFusedMoEMethod,
-        )
-
-        UnquantizedFusedMoEMethod.process_weights_after_loading(self, layer)
+        super().__init__(quant_config)
 
     def process_loaded_weights(self, layer: nn.Layer, state_dict):
         """Stack individual expert weights into the stacked parameter."""
@@ -1929,33 +1905,45 @@ class TritonBF16MoEMethod(QuantMethodBase):
         layer.up_gate_proj_weight.set_value(paddle.stack(up_gate_proj_weights, axis=0))
         layer.down_proj_weight.set_value(paddle.stack(down_proj_weights, axis=0))
 
-    def _get_default_config(self, M: int, N: int, K: int) -> dict:
+    def _get_default_config(self, M: int, N: int, K: int, num_experts: int = 64) -> dict:
         """
-        Heuristic tile config for BF16 MoE, mirroring vLLM's get_default_config logic.
-        M: number of token-expert pairs (post-padded) / BLOCK_SIZE_M
+        Heuristic tile config for BF16 MoE, aligned with vLLM's get_default_config logic.
+        M: number of token-expert pairs
         N: output dimension of the GEMM
         K: input dimension of the GEMM
+        num_experts: number of local experts (for GROUP_SIZE_M heuristic)
         """
         if M <= 32:
-            block_m, block_n, block_k = 16, 64, 64
+            block_m, block_n, block_k = 16, 64, 128
+            num_warps, num_stages = 4, 4
+        elif M <= 96:
+            block_m, block_n, block_k = 32, 64, 128
+            num_warps, num_stages = 4, 3
         elif M <= 512:
-            block_m, block_n, block_k = 32, 128, 64
+            block_m, block_n, block_k = 64, 128, 64
+            num_warps, num_stages = 8, 3
         else:
             block_m, block_n, block_k = 128, 128, 64
+            num_warps, num_stages = 8, 3
+
+        tokens_per_expert = M // max(num_experts, 1)
+        group_m = 16 if tokens_per_expert > 128 else 1
+
         return {
             "BLOCK_SIZE_M": block_m,
             "BLOCK_SIZE_N": block_n,
             "BLOCK_SIZE_K": block_k,
-            "GROUP_SIZE_M": 8,
+            "GROUP_SIZE_M": group_m,
+            "num_warps": num_warps,
+            "num_stages": num_stages,
         }
 
-    def apply(
+    def apply_tp(
         self,
         layer: nn.Layer,
         x: paddle.Tensor,
         gate: nn.Layer,
         topk_ids_hookfunc: Callable = None,
-        shared_experts: nn.Layer = None,
         fc1_latent_proj: nn.Layer = None,
         fc2_latent_proj: nn.Layer = None,
     ) -> paddle.Tensor:
@@ -1971,9 +1959,6 @@ class TritonBF16MoEMethod(QuantMethodBase):
              (with MUL_ROUTED_WEIGHT=True to fuse router weight multiplication)
           6. Reshape + sum over topk dim
         """
-        if shared_experts is not None:
-            raise NotImplementedError("TritonBF16MoEMethod does not support shared_experts yet.")
-
         token_num = x.shape[0]
         if token_num == 0:
             return paddle.zeros([token_num, layer.hidden_size], dtype=x.dtype)
@@ -2025,7 +2010,10 @@ class TritonBF16MoEMethod(QuantMethodBase):
         # from fastdeploy.model_executor.ops.gpu import tritonmoe_preprocess_func
 
         num_token_expert_pairs = token_num * top_k
-        cfg = self._get_default_config(num_token_expert_pairs, moe_intermediate_size * 2, hidden_size)
+        # Use token_num (not pairs) for config selection, matching vLLM's heuristic:
+        # M represents "how many unique tokens each expert sees on average", which
+        # determines whether the workload is memory-bound (decode) or compute-bound (prefill).
+        cfg = self._get_default_config(token_num, moe_intermediate_size * 2, hidden_size, num_local_experts)
 
         # Use naive_block_assignment when token count is very small (decode scenario).
         # Each M-block handles exactly one token-expert pair, skipping the expensive
@@ -2045,6 +2033,12 @@ class TritonBF16MoEMethod(QuantMethodBase):
                 topk_ids, num_local_experts, cfg["BLOCK_SIZE_M"]
             )
             max_possible_num_post_padded = sorted_token_ids.shape[0]
+            # Grid clipping: avoid launching blocks that will immediately early-return
+            if token_num < cfg["BLOCK_SIZE_M"]:
+                max_possible_num_post_padded = min(
+                    max_possible_num_post_padded,
+                    token_num * top_k * cfg["BLOCK_SIZE_M"],
+                )
 
         # --- 3. GEMM1: hidden -> up_gate (BF16 x BF16 -> BF16) ---
         # up_gate_proj_weight layout: [E, hidden_size, inter*2] => stride_be, stride_bk, stride_bn
@@ -2083,44 +2077,48 @@ class TritonBF16MoEMethod(QuantMethodBase):
             top_k=top_k,
             compute_type=tl.bfloat16,
             naive_block_assignment=use_naive,
+            even_Ks=(hidden_size % cfg["BLOCK_SIZE_K"] == 0),
+            num_warps=cfg["num_warps"],
+            num_stages=cfg["num_stages"],
         )
 
         # --- 4. SwiGLU activation ---
         down_proj_input = paddle.incubate.nn.functional.swiglu(up_gate_proj_out)
 
         # --- 5. GEMM2: inter -> hidden, fuse router weight multiplication ---
+        # Kernel loads topk_weights with flat offset (topk_weights_ptr + offs_token),
+        # which assumes contiguous row-major layout (stride[-1] == 1).
+        if not topk_weights.is_contiguous():
+            topk_weights = topk_weights.contiguous()
+
         # down_proj_weight layout: [E, moe_intermediate_size, hidden_size] => stride_be, stride_bk, stride_bn
         down_proj_out = paddle.empty(
             (num_token_expert_pairs, hidden_size),
             dtype=x.dtype,
         )
-        cfg2 = self._get_default_config(num_token_expert_pairs, hidden_size, moe_intermediate_size)
-
-        # GEMM2 in naive mode: down_proj_input is [num_token_expert_pairs, N], each row
-        # is already a flat token-expert pair, so we reuse the same naive assignment.
-        # However GEMM2 needs its own preprocess if BLOCK_SIZE_M differs from cfg.
+        # Reuse the same config and preprocess results as GEMM1.
+        # The preprocess output only depends on BLOCK_SIZE_M (the M-tile alignment),
+        # which is determined solely by token_num and is identical for both GEMMs.
+        # This matches vLLM's approach of using one config for both GEMMs.
         if use_naive:
-            max_possible_num_post_padded_2 = num_token_expert_pairs * cfg2["BLOCK_SIZE_M"]
+            max_possible_num_post_padded_2 = num_token_expert_pairs * cfg["BLOCK_SIZE_M"]
             num_tokens_post_padded_2 = paddle.full([1], max_possible_num_post_padded_2, dtype="int32")
-            # For GEMM2, expert_ids per pair is the same; topk_ids reshaped is still valid.
             expert_ids_2 = expert_ids
             sorted_token_ids_2 = expert_ids
         else:
-            # Standard path may need different preprocess if BLOCK_SIZE_M differs
-            if cfg2["BLOCK_SIZE_M"] != cfg["BLOCK_SIZE_M"]:
-                sorted_token_ids_2, expert_ids_2, num_tokens_post_padded_2 = tritonmoe_preprocess_func(
-                    topk_ids, num_local_experts, cfg2["BLOCK_SIZE_M"]
+            sorted_token_ids_2 = sorted_token_ids
+            expert_ids_2 = expert_ids
+            num_tokens_post_padded_2 = num_tokens_post_padded
+            max_possible_num_post_padded_2 = max_possible_num_post_padded
+            # Grid clipping for GEMM2
+            if token_num < cfg["BLOCK_SIZE_M"]:
+                max_possible_num_post_padded_2 = min(
+                    max_possible_num_post_padded_2,
+                    token_num * top_k * cfg["BLOCK_SIZE_M"],
                 )
-                max_possible_num_post_padded_2 = sorted_token_ids_2.shape[0]
-            else:
-                sorted_token_ids_2 = sorted_token_ids
-                expert_ids_2 = expert_ids
-                num_tokens_post_padded_2 = num_tokens_post_padded
-                max_possible_num_post_padded_2 = max_possible_num_post_padded
 
         grid2 = (
-            ceil_div(max_possible_num_post_padded_2, cfg2["BLOCK_SIZE_M"])
-            * ceil_div(hidden_size, cfg2["BLOCK_SIZE_N"]),
+            ceil_div(max_possible_num_post_padded_2, cfg["BLOCK_SIZE_M"]) * ceil_div(hidden_size, cfg["BLOCK_SIZE_N"]),
         )
         fused_moe_kernel_bf16[grid2](
             down_proj_input,
@@ -2141,14 +2139,17 @@ class TritonBF16MoEMethod(QuantMethodBase):
             stride_bn=layer.down_proj_weight.strides[2],
             stride_cm=down_proj_out.strides[0],
             stride_cn=down_proj_out.strides[1],
-            BLOCK_SIZE_M=cfg2["BLOCK_SIZE_M"],
-            BLOCK_SIZE_N=cfg2["BLOCK_SIZE_N"],
-            BLOCK_SIZE_K=cfg2["BLOCK_SIZE_K"],
-            GROUP_SIZE_M=cfg2["GROUP_SIZE_M"],
+            BLOCK_SIZE_M=cfg["BLOCK_SIZE_M"],
+            BLOCK_SIZE_N=cfg["BLOCK_SIZE_N"],
+            BLOCK_SIZE_K=cfg["BLOCK_SIZE_K"],
+            GROUP_SIZE_M=cfg["GROUP_SIZE_M"],
             MUL_ROUTED_WEIGHT=True,  # fuse router weight * output
             top_k=1,
             compute_type=tl.bfloat16,
             naive_block_assignment=use_naive,
+            even_Ks=(moe_intermediate_size % cfg["BLOCK_SIZE_K"] == 0),
+            num_warps=cfg["num_warps"],
+            num_stages=cfg["num_stages"],
         )
 
         # --- 6. Reduce over topk ---
@@ -2156,13 +2157,12 @@ class TritonBF16MoEMethod(QuantMethodBase):
         out = down_proj_out.sum(axis=1)
         return out
 
-    def apply_ep_prefill(self, layer, x, gate, topk_ids_hookfunc=None, shared_experts=None):
-        raise NotImplementedError("TritonBF16MoEMethod does not support EP prefill yet.")
-
-    def apply_ep_decode(self, layer, x, gate, topk_ids_hookfunc=None, shared_experts=None):
-        raise NotImplementedError("TritonBF16MoEMethod does not support EP decode yet.")
-
-    def apply_tp(
+    def apply_ep_prefill(
         self, layer, x, gate, topk_ids_hookfunc=None, shared_experts=None, fc1_latent_proj=None, fc2_latent_proj=None
     ):
-        return self.apply(layer, x, gate, topk_ids_hookfunc, shared_experts, fc1_latent_proj, fc2_latent_proj)
+        raise NotImplementedError("TritonMoEMethod does not support EP prefill yet.")
+
+    def apply_ep_decode(
+        self, layer, x, gate, topk_ids_hookfunc=None, shared_experts=None, fc1_latent_proj=None, fc2_latent_proj=None
+    ):
+        raise NotImplementedError("TritonMoEMethod does not support EP decode yet.")

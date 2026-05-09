@@ -243,6 +243,7 @@ def fused_moe_kernel_bf16(
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     naive_block_assignment: tl.constexpr = False,
+    even_Ks: tl.constexpr = False,
 ):
     """
     BF16 Fused-MoE GEMM kernel, ported from vLLM.
@@ -304,16 +305,20 @@ def fused_moe_kernel_bf16(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(
-            a_ptrs,
-            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-            other=0.0,
-        )
-        b = tl.load(
-            b_ptrs,
-            mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
-            other=0.0,
-        )
+        if even_Ks:
+            a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+            b = tl.load(b_ptrs)
+        else:
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                other=0.0,
+            )
+            b = tl.load(
+                b_ptrs,
+                mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
+                other=0.0,
+            )
         accumulator += tl.dot(a, b)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
