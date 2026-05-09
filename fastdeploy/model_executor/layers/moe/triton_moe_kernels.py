@@ -242,6 +242,7 @@ def fused_moe_kernel_bf16(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
+    naive_block_assignment: tl.constexpr = False,
 ):
     """
     BF16 Fused-MoE GEMM kernel, ported from vLLM.
@@ -252,6 +253,13 @@ def fused_moe_kernel_bf16(
 
     sorted_token_ids: [EM]  flat token-expert pair indices (int32)
     expert_ids:       [EM // BLOCK_SIZE_M]  expert index per M-block (int32)
+
+    When naive_block_assignment=True, each M-block processes exactly one
+    token-expert pair (skipping the preprocess/sort step). In this mode:
+      - expert_ids[pid_m] holds the expert index for token-expert pair pid_m
+      - sorted_token_ids_ptr is unused
+      - offs_token is constructed as [pid_m, invalid, invalid, ...]
+    This avoids the preprocess kernel overhead for very small token counts.
     """
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
@@ -268,8 +276,16 @@ def fused_moe_kernel_bf16(
         return
 
     offs = tl.arange(0, BLOCK_SIZE_M)
-    offs_token_id = pid_m * BLOCK_SIZE_M + offs
-    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+
+    if not naive_block_assignment:
+        offs_token_id = pid_m * BLOCK_SIZE_M + offs
+        offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    else:
+        # Each block handles exactly one token-expert pair:
+        # row 0 = pid_m (the token-expert pair index), remaining rows are
+        # set to num_valid_tokens which will fail the < mask check.
+        offs_token = tl.where(offs == 0, pid_m, num_valid_tokens)
+
     # Cast to int64 to prevent overflow: stride_cm * offs_token can exceed int32
     offs_token = offs_token.to(tl.int64)
     token_mask = offs_token < num_valid_tokens
