@@ -18,7 +18,6 @@ from typing import Callable
 
 import paddle
 import paddle.nn.functional as F
-import triton.language as tl
 from paddle import nn
 
 import fastdeploy
@@ -34,7 +33,6 @@ from fastdeploy.model_executor.layers.quantization.fp8_utils import (
 )
 from fastdeploy.model_executor.layers.quantization.ops import scaled_fp8_quant
 from fastdeploy.model_executor.layers.utils import get_tensor
-from fastdeploy.model_executor.ops.gpu import tritonmoe_preprocess_func
 from fastdeploy.model_executor.utils import (
     TensorTracker,
     free_tensor,
@@ -44,6 +42,13 @@ from fastdeploy.model_executor.utils import (
 )
 from fastdeploy.platforms import current_platform
 from fastdeploy.utils import ceil_div, register_custom_python_op
+
+try:
+    import triton.language as tl
+
+    from fastdeploy.model_executor.ops.gpu import tritonmoe_preprocess_func
+except:
+    pass
 
 from ..quantization.quant_base import QuantMethodBase
 from .fused_moe_backend_base import UnquantizedFusedMoEMethod
@@ -1970,14 +1975,9 @@ class TritonMoEMethod(UnquantizedFusedMoEMethod):
 
         # --- 1. Routing ---
         gate_out = gate(x)
+        gate_out = gate_out.cast("float32")
 
         if layer.topk_method == "noaux_tc":
-            from fastdeploy.model_executor.layers.moe.moe import get_moe_scores
-
-            use_fused = not fastdeploy.envs.FD_ENABLE_RL and current_platform.is_cuda()
-            if not use_fused:
-                gate_out = gate_out.cast("float32")
-
             _, topk_weights, topk_ids = get_moe_scores(
                 gate_out,
                 layer.n_group,
@@ -1986,11 +1986,9 @@ class TritonMoEMethod(UnquantizedFusedMoEMethod):
                 layer.routed_scaling_factor,
                 layer.gate_correction_bias,
                 getattr(layer, "renormalize", True),
-                use_fused_cast=use_fused,
                 topk_reduce_func=getattr(layer, "topk_reduce_func", None),
             )
         else:
-            gate_out = gate_out.cast("float32")
             topk_ids, topk_weights = fastdeploy.model_executor.ops.gpu.moe_topk_select(
                 gate_out,
                 layer.gate_correction_bias,
