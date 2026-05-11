@@ -1259,7 +1259,7 @@ class TestTritonMoEMethod:
             ), f"Kernel call {i} should have naive_block_assignment=False"
 
     def test_naive_block_assignment_grid_size(self, fake_ops, monkeypatch):
-        """In naive mode, grid should be much smaller (num_pairs * cdiv(N, BLOCK_N))."""
+        """In naive mode, grid should be num_pairs * BLOCK_SIZE_M based."""
         method = backend.TritonMoEMethod()
         layer = self._make_layer(num_experts=256, hidden_size=64, intermediate_size=32, top_k=8)
         self._create_weights(method, layer)
@@ -1270,7 +1270,7 @@ class TestTritonMoEMethod:
         method.apply(layer, x, gate)
 
         # token_num=1, top_k=8 → num_pairs=8
-        # cfg for M=token_num=1: BLOCK_SIZE_M=16, BLOCK_SIZE_N=64
+        # cfg for M=num_pairs=8: BLOCK_SIZE_M=16, BLOCK_SIZE_N=64
         # naive: EM = 8 * 16 = 128, grid_M = cdiv(128,16) = 8
         # GEMM1: N=intermediate*2=64, grid_N = cdiv(64,64) = 1
         # grid1 = 8 * 1 = 8
@@ -1300,10 +1300,6 @@ class TestTritonMoEMethod:
 
         # In naive mode, expert_ids (6th positional arg, index 5) should be [3, 7] (int32)
         gemm1_args = kernel.calls[0]["kwargs"]
-        # expert_ids is positional arg — let's check via the recorded calls
-        # The kernel is called as fused_moe_kernel_bf16[grid](x, weight, out, weights_ptr,
-        #     sorted_token_ids, expert_ids, num_tokens_post_padded, ...)
-        # But DummyBF16Kernel only records kwargs; let's just verify naive_block_assignment is set
         assert gemm1_args.get("naive_block_assignment") is True
 
     def test_naive_boundary_exact(self, fake_ops, monkeypatch):

@@ -2002,43 +2002,28 @@ class TritonMoEMethod(UnquantizedFusedMoEMethod):
         if topk_ids_hookfunc is not None:
             topk_ids_hookfunc(topk_ids=topk_ids)
 
-        # # Ensure topk_ids is int64 (noaux_tc may return int32, tritonmoe_preprocess requires int64)
-        # if topk_ids.dtype != paddle.int64:
-        #     topk_ids = topk_ids.cast("int64")
-
         # --- 2. Preprocess: sort tokens by expert assignment ---
-        # from fastdeploy.model_executor.ops.gpu import tritonmoe_preprocess_func
-
         num_token_expert_pairs = token_num * top_k
-        # Use token_num (not pairs) for config selection, matching vLLM's heuristic:
-        # M represents "how many unique tokens each expert sees on average", which
-        # determines whether the workload is memory-bound (decode) or compute-bound (prefill).
-        cfg = self._get_default_config(token_num, moe_intermediate_size * 2, hidden_size, num_local_experts)
+        cfg = self._get_default_config(
+            num_token_expert_pairs, moe_intermediate_size * 2, hidden_size, num_local_experts
+        )
 
         # Use naive_block_assignment when token count is very small (decode scenario).
         # Each M-block handles exactly one token-expert pair, skipping the expensive
-        # preprocess sort kernel. Condition mirrors vLLM: num_pairs * 4 <= num_experts.
+        # preprocess sort kernel.
         _SPARSITY_FACTOR = 4
         use_naive = num_token_expert_pairs * _SPARSITY_FACTOR <= num_local_experts
 
         if use_naive:
-            # Skip preprocess: use topk_ids directly as expert_ids (one per pair)
             expert_ids = topk_ids.reshape([-1]).cast("int32")
             num_tokens_post_padded = paddle.full([1], num_token_expert_pairs * cfg["BLOCK_SIZE_M"], dtype="int32")
             max_possible_num_post_padded = num_token_expert_pairs * cfg["BLOCK_SIZE_M"]
-            # sorted_token_ids is not used in naive mode; pass expert_ids as a valid ptr
             sorted_token_ids = expert_ids
         else:
             sorted_token_ids, expert_ids, num_tokens_post_padded = tritonmoe_preprocess_func(
                 topk_ids, num_local_experts, cfg["BLOCK_SIZE_M"]
             )
             max_possible_num_post_padded = sorted_token_ids.shape[0]
-            # Grid clipping: avoid launching blocks that will immediately early-return
-            if token_num < cfg["BLOCK_SIZE_M"]:
-                max_possible_num_post_padded = min(
-                    max_possible_num_post_padded,
-                    token_num * top_k * cfg["BLOCK_SIZE_M"],
-                )
 
         # --- 3. GEMM1: hidden -> up_gate (BF16 x BF16 -> BF16) ---
         # up_gate_proj_weight layout: [E, hidden_size, inter*2] => stride_be, stride_bk, stride_bn
@@ -2086,8 +2071,6 @@ class TritonMoEMethod(UnquantizedFusedMoEMethod):
         down_proj_input = paddle.incubate.nn.functional.swiglu(up_gate_proj_out)
 
         # --- 5. GEMM2: inter -> hidden, fuse router weight multiplication ---
-        # Kernel loads topk_weights with flat offset (topk_weights_ptr + offs_token),
-        # which assumes contiguous row-major layout (stride[-1] == 1).
         if not topk_weights.is_contiguous():
             topk_weights = topk_weights.contiguous()
 
@@ -2096,41 +2079,20 @@ class TritonMoEMethod(UnquantizedFusedMoEMethod):
             (num_token_expert_pairs, hidden_size),
             dtype=x.dtype,
         )
-        # Reuse the same config and preprocess results as GEMM1.
-        # The preprocess output only depends on BLOCK_SIZE_M (the M-tile alignment),
-        # which is determined solely by token_num and is identical for both GEMMs.
-        # This matches vLLM's approach of using one config for both GEMMs.
-        if use_naive:
-            max_possible_num_post_padded_2 = num_token_expert_pairs * cfg["BLOCK_SIZE_M"]
-            num_tokens_post_padded_2 = paddle.full([1], max_possible_num_post_padded_2, dtype="int32")
-            expert_ids_2 = expert_ids
-            sorted_token_ids_2 = expert_ids
-        else:
-            sorted_token_ids_2 = sorted_token_ids
-            expert_ids_2 = expert_ids
-            num_tokens_post_padded_2 = num_tokens_post_padded
-            max_possible_num_post_padded_2 = max_possible_num_post_padded
-            # Grid clipping for GEMM2
-            if token_num < cfg["BLOCK_SIZE_M"]:
-                max_possible_num_post_padded_2 = min(
-                    max_possible_num_post_padded_2,
-                    token_num * top_k * cfg["BLOCK_SIZE_M"],
-                )
-
         grid2 = (
-            ceil_div(max_possible_num_post_padded_2, cfg["BLOCK_SIZE_M"]) * ceil_div(hidden_size, cfg["BLOCK_SIZE_N"]),
+            ceil_div(max_possible_num_post_padded, cfg["BLOCK_SIZE_M"]) * ceil_div(hidden_size, cfg["BLOCK_SIZE_N"]),
         )
         fused_moe_kernel_bf16[grid2](
             down_proj_input,
             layer.down_proj_weight,
             down_proj_out,
             topk_weights,
-            sorted_token_ids_2,
-            expert_ids_2,
-            num_tokens_post_padded_2,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
             N=hidden_size,
             K=moe_intermediate_size,
-            EM=max_possible_num_post_padded_2,
+            EM=max_possible_num_post_padded,
             num_valid_tokens=num_token_expert_pairs,
             stride_am=down_proj_input.strides[0],
             stride_ak=down_proj_input.strides[1],
@@ -2143,7 +2105,7 @@ class TritonMoEMethod(UnquantizedFusedMoEMethod):
             BLOCK_SIZE_N=cfg["BLOCK_SIZE_N"],
             BLOCK_SIZE_K=cfg["BLOCK_SIZE_K"],
             GROUP_SIZE_M=cfg["GROUP_SIZE_M"],
-            MUL_ROUTED_WEIGHT=True,  # fuse router weight * output
+            MUL_ROUTED_WEIGHT=True,
             top_k=1,
             compute_type=tl.bfloat16,
             naive_block_assignment=use_naive,
