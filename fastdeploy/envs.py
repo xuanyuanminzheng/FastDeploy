@@ -74,6 +74,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "FD_SAMPLING_CLASS": lambda: os.getenv("FD_SAMPLING_CLASS", "base"),
     # Set moe backend."cutlass","marlin", "triton", "flashinfer-cutlass", "flashinfer-cutedsl" and "flashinfer-trtllm" can be set currently.
     "FD_MOE_BACKEND": lambda: os.getenv("FD_MOE_BACKEND", "cutlass"),
+    # Enable multi-stream overlap for shared experts in MoE layers (TP mode only).
+    "FD_SHARED_EXPERT_OVERLAP": lambda: bool(int(os.getenv("FD_SHARED_EXPERT_OVERLAP", "0"))),
+    # Token threshold for shared expert overlap. Only overlap when batch <= threshold.
+    "FD_SHARED_EXPERT_OVERLAP_THRESHOLD": lambda: int(os.getenv("FD_SHARED_EXPERT_OVERLAP_THRESHOLD", "256")),
     # Set nvfp4 load interleaved weight scale.
     "FD_NVFP4_LOAD_BLOCKSCALE_LEAVE": lambda: os.getenv("FD_NVFP4_LOAD_BLOCKSCALE_LEAVE", "0"),
     # Set mxfp4 backend."flashinfer" can be set currently.

@@ -19,12 +19,14 @@ from .fused_moe_cutlass_backend import (
 )
 from .fused_moe_triton_backend import TritonMoEMethod, TritonWeightOnlyMoEMethod
 from .moe import FusedMoE
+from .shared_expert_overlap import SharedExpertOverlap
 
 __all__ = [
     CutlassWeightOnlyMoEMethod,
     CutlassW4A8MoEMethod,
     CutlassW4AFP8MoEMethod,
     FusedMoE,
+    SharedExpertOverlap,
     TritonWeightOnlyMoEMethod,
     TritonMoEMethod,
 ]

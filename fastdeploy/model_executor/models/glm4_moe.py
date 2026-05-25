@@ -199,10 +199,33 @@ class Glm4Moe(nn.Layer):
                 reduce_results=not self.merge_ffn_tp,
             )
 
+        # Multi-stream shared expert overlap (only in TP mode; EP has its own overlap)
+        if self.n_shared_experts > 0 and not self.use_ep:
+            from fastdeploy.model_executor.layers.moe.shared_expert_overlap import (
+                SharedExpertOverlap,
+            )
+
+            self._shared_expert_overlap = SharedExpertOverlap(self.shared_experts)
+        else:
+            self._shared_expert_overlap = None
+
     def forward(self, x, forward_meta: ForwardMeta = None):
-        out = self.experts(x, self.gate, forward_meta)
-        if self.n_shared_experts > 0:
-            out = out + self.shared_experts(x)
+        if self.n_shared_experts > 0 and self._shared_expert_overlap is not None:
+            # Try multi-stream overlap: launch shared experts on aux stream
+            overlap_started = self._shared_expert_overlap.maybe_start(x, forward_meta)
+            # Run routed experts on main stream (concurrently with shared experts if overlap started)
+            out = self.experts(x, self.gate, forward_meta)
+            # Get shared expert result
+            if overlap_started:
+                shared_out = self._shared_expert_overlap.finish()
+            else:
+                shared_out = self.shared_experts(x)
+            out = out + shared_out
+        else:
+            out = self.experts(x, self.gate, forward_meta)
+            if self.n_shared_experts > 0:
+                out = out + self.shared_experts(x)
+
         if self.merge_ffn_tp:
             need_tp_all_reduce_fusion = self.enable_all_reduce_fusion and out.shape[0] <= 2048
             if not need_tp_all_reduce_fusion:
